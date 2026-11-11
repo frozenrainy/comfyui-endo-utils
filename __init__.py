@@ -5,6 +5,8 @@ FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (�
 WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
 
 VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
+FrameSeqCheck · FrameSeqWrite(where=output) — 이어서 하기: 프레임을 출력 폴더에 남기고, 다시 실행하면 이미 있는 조각은 건너뜀.
+  프레임은 다 쓴 뒤에만 이름이 붙고(.tmp → 바꿈), 같은 이름에 다른 작업 흔적이 있으면 멈춘다. FrameSeqVideo cleanup — 끝나면 지움.
 
 AnchorPick — 후보 영상에서 번호로 앵커를 고르고 파일로 보관. lock=켜면 보관본을 쓰고 후보 영상 입력을
   아예 요청하지 않는다(지연 입력) → 후보 생성이 다시 돌지 않음. WAN 생성은 같은 시드여도 실행마다 달라지므로
@@ -487,10 +489,64 @@ class DepthStats:
         return ({"lo": float(lo), "hi": float(hi)}, f"역수 depth {depth.shape[0]}f 기준 lo {float(lo):.4g} · hi {float(hi):.4g}")
 
 
-def _seq_dir(name):
+SEQ_WHERE = ["temp", "output"]
+
+
+def _seq_dir(name, where="temp"):
+    """temp = ComfyUI 임시 폴더(재시작 때 비워짐) · output = 출력 폴더 아래 endo_seq/ (남음 — 이어서 하기용)."""
     import os, folder_paths
     safe = "".join(c for c in name if c.isalnum() or c in "-_") or "clip"
-    return os.path.join(folder_paths.get_temp_directory(), "endo_seq", safe)
+    base = folder_paths.get_output_directory() if where == "output" else folder_paths.get_temp_directory()
+    return os.path.join(base, "endo_seq", safe)
+
+
+def _seq_meta(d):
+    import json, os
+    try:
+        with open(os.path.join(d, "meta.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _frames_present(d, lo, hi, sub="img"):
+    import os
+    return all(os.path.exists(os.path.join(d, sub, f"{k:06d}.png")) for k in range(lo, hi))
+
+
+class FrameSeqCheck:
+    """이어서 하기: 이 조각 [offset, offset+count) 프레임이 이미 디스크에 다 있나(클립 끝 total 에서 자름).
+    resume 끔이면 늘 '없음'. 같은 이름 폴더에 프레임 수가 다른 작업 흔적이 있으면 멈춘다(설정을 바꾼 채 이어 붙이는 사고 방지)."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "name": ("STRING", {"default": "clip"}),
+            "where": (SEQ_WHERE, {"default": "output"}),
+            "offset": ("INT", {"default": 0, "min": 0, "max": 1_000_000}),
+            "count": ("INT", {"default": 1, "min": 1, "max": 1_000_000}),
+            "total": ("INT", {"default": 0, "min": 0, "max": 1_000_000}),
+            "resume": ("BOOLEAN", {"default": True}),
+        }}
+
+    RETURN_TYPES = ("BOOLEAN", "STRING")
+    RETURN_NAMES = ("done", "seq_dir")
+    FUNCTION = "run"
+    CATEGORY = "endo/video"
+
+    @classmethod
+    def IS_CHANGED(cls, **kw):
+        return float("nan")                     # 디스크 상태를 묻는 노드 — 캐시하면 안 됨
+
+    def run(self, name, where, offset, count, total, resume):
+        d = _seq_dir(name, where)
+        if not resume:
+            return (False, d)
+        meta = _seq_meta(d)
+        if meta is not None and total and meta.get("total") != total:
+            raise ValueError(f"'{name}' 작업 폴더에 다른 작업 흔적이 있습니다(프레임 수 {meta.get('total')} ≠ 이번 {total}) — "
+                             f"설정·영상을 바꿨다면 '이어서 하기' 를 끄거나 출력 이름을 바꾸세요: {d}")
+        hi = min(offset + count, total) if total else offset + count
+        return (meta is not None and _frames_present(d, offset, hi), d)
 
 
 class FrameSeqWrite:
@@ -505,6 +561,7 @@ class FrameSeqWrite:
             "reset": ("BOOLEAN", {"default": False}),
         }, "optional": {
             "depth": ("IMAGE", {"tooltip": "같은 번호로 depth 도 저장 (미리보기용)"}),
+            "where": (SEQ_WHERE, {"default": "temp", "tooltip": "temp = 임시(재시작 때 비워짐) · output = 남김(이어서 하기)"}),
         }}
 
     RETURN_TYPES = ("STRING",)
@@ -512,18 +569,28 @@ class FrameSeqWrite:
     FUNCTION = "run"
     CATEGORY = "endo/video"
 
-    def run(self, images, name, offset, total, reset, depth=None):
-        import os, shutil
+    def run(self, images, name, offset, total, reset, depth=None, where="temp"):
+        import json, os, shutil
         from PIL import Image
-        d = _seq_dir(name)
+        d = _seq_dir(name, where)
         if reset and os.path.isdir(d): shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
+        meta = _seq_meta(d)
+        if meta is None:
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump({"total": total, "width": int(images.shape[2]), "height": int(images.shape[1])}, f)
+        elif (meta.get("total"), meta.get("width"), meta.get("height")) != (total, int(images.shape[2]), int(images.shape[1])):
+            raise ValueError(f"'{name}' 작업 폴더의 프레임({meta.get('width')}×{meta.get('height')}, {meta.get('total')}장)과 이번 조각"
+                             f"({images.shape[2]}×{images.shape[1]}, {total}장)이 다릅니다 — 처음부터 하려면 '이어서 하기' 를 끄세요: {d}")
         for sub, t in (("img", images), ("depth", depth)):
             if t is None: continue
             os.makedirs(os.path.join(d, sub), exist_ok=True)
             for k in range(t.shape[0]):
                 if total and offset + k >= total: break
                 a = (t[k].cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(a).save(os.path.join(d, sub, f"{offset + k:06d}.png"), compress_level=1)
+                path = os.path.join(d, sub, f"{offset + k:06d}.png")
+                Image.fromarray(a).save(path + ".tmp", format="PNG", compress_level=1)
+                os.replace(path + ".tmp", path)          # 다 쓴 뒤에만 이름이 붙음 — 끊기면 반쪽 파일이 안 남는다
         return (d,)
 
 
@@ -542,8 +609,8 @@ def _encode_mp4(frames, n, fps, path):
         for p in s.encode(): c.mux(p)
 
 
-def _mux_audio(path, src):
-    """path(영상만) 에 src 영상의 첫 소리 트랙을 그대로(재인코딩 없이) 붙인다. 영상 길이를 넘는 소리는 버림.
+def _mux_audio(path, src, start=0.0):
+    """path(영상만) 에 src 영상의 첫 소리 트랙을 그대로(재인코딩 없이) 붙인다. start 초부터, 영상 길이를 넘는 소리는 버림.
     소리가 없으면 아무것도 안 하고 False."""
     import av, heapq, os
     if hasattr(src, "seek"): src.seek(0)
@@ -556,9 +623,15 @@ def _mux_audio(path, src):
         vi, ai = v.streams.video[0], a.streams.audio[0]
         vo, ao = out.add_stream_from_template(vi), out.add_stream_from_template(ai)
         end = float(vi.duration * vi.time_base) if vi.duration else (v.duration / 1e6 if v.duration else None)
+        shift = int(round(start / ai.time_base)) if start else 0
+        if start:
+            a.seek(int(start * 1e6), any_frame=False, backward=True)   # av.time_base(µs) — 그 앞 키 패킷부터
         def packets(c, st, o):
             for p in c.demux(st):
                 if p.dts is None: continue
+                if o is ao and shift:
+                    if p.pts is not None and p.pts < shift: continue
+                    p.pts -= shift; p.dts -= shift
                 t = float(p.dts * st.time_base)
                 if o is ao and end is not None and p.pts is not None and float(p.pts * st.time_base) >= end: return
                 yield t, id(o), p, o
@@ -587,6 +660,8 @@ class FrameSeqVideo:
             "images": ("IMAGE", {"lazy": True}),
             "seq_dir": ("STRING", {"lazy": True, "forceInput": True}),
             "audio_from": ("VIDEO", {"tooltip": "이 영상의 소리를 그대로 붙임 (없으면 소리 없이)"}),
+            "audio_start": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 36000.0, "step": 0.01, "tooltip": "소리를 원본의 몇 초부터"}),
+            "cleanup": ("BOOLEAN", {"default": False, "tooltip": "lock 켬: 영상을 다 만든 뒤 프레임 폴더(seq_dir)를 지움"}),
         }}
 
     RETURN_TYPES = ("STRING",)
@@ -596,11 +671,11 @@ class FrameSeqVideo:
     CATEGORY = "endo/video"
 
     def check_lazy_status(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None,
-                          audio_from=None):
+                          audio_from=None, audio_start=0.0, cleanup=False):
         return ["seq_dir"] if lock else ["images"]
 
     def run(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None,
-            audio_from=None):
+            audio_from=None, audio_start=0.0, cleanup=False):
         import os, folder_paths
         from PIL import Image
         if lock:
@@ -619,7 +694,10 @@ class FrameSeqVideo:
         path = os.path.join(out_dir, file)
         _encode_mp4(frames, n, fps, path)
         if audio_from is not None:
-            _mux_audio(path, audio_from.get_stream_source())
+            _mux_audio(path, audio_from.get_stream_source(), audio_start)
+        if lock and cleanup:
+            import shutil
+            shutil.rmtree(seq_dir, ignore_errors=True)
         return {"ui": {"images": [{"filename": file, "subfolder": sub, "type": "output" if save_output else "temp"}], "animated": (True,)},
                 "result": (path,)}
 
@@ -773,7 +851,7 @@ class WanLoraPair:
 NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
-                       "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "VideoLoadFrames": VideoLoadFrames,
+                       "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
                        "DepthStats": DepthStats, "FrameSeqWrite": FrameSeqWrite, "FrameSeqVideo": FrameSeqVideo,
                        "DepthPadSettings": DepthPadSettings, "DepthNormalizeChained": DepthNormalizeChained}
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
@@ -786,6 +864,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규�
                               "VideoRetimeSettings": "원본 프레임 복원 설정",
                               "VideoClipInfo": "클립 스캔 (프레임 수·로드 크기·진단)",
                               "VideoInfo": "영상 정보 (원래 크기·fps·프레임 수·소리 유무)",
+                              "FrameSeqCheck": "이어서 하기 — 이 조각 프레임이 이미 있나",
                               "VideoLoadFrames": "클립 구간 로드 (프레임 번호 범위 — 파트 루프용)",
                               "DepthStats": "Depth 정규화 기준 (클립 전체 표본)",
                               "FrameSeqWrite": "프레임 파일로 쓰기 (파트 결과, RAM 누적 없음)",
