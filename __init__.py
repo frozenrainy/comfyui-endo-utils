@@ -2,6 +2,8 @@
 
 FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (앵커 프레임 번호 고르기용).
 
+WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
+
 AnchorPick — 후보 영상에서 번호로 앵커를 고르고 파일로 보관. lock=켜면 보관본을 쓰고 후보 영상 입력을
   아예 요청하지 않는다(지연 입력) → 후보 생성이 다시 돌지 않음. WAN 생성은 같은 시드여도 실행마다 달라지므로
   (실측 PSNR ~21dB) 캐시가 비워진 뒤 재생성하면 같은 번호가 다른 그림이 된다 — 고른 앵커를 고정하는 장치.
@@ -675,13 +677,49 @@ class AnchorPick:
         return (anchor, sheet)
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "FrameContactSheet": FrameContactSheet,
+class WanLoraPair:
+    """WAN 2.2 LoRA 한 쌍 — HIGH 모델엔 HIGH 파일, LOW 모델엔 LOW 파일을 각자 강도로. WAN 2.2 LoRA 는 대부분
+    HIGH/LOW 두 파일이라 한 줄에 같이 둔다. 파일이 None 이거나 강도 0 이면 그쪽은 건드리지 않음(파일도 안 읽음).
+    텍스트 인코더 쪽 강도는 없다 — WAN LoRA 는 거의 umt5 가중치가 없고, ② 같은 단계엔 인코더가 아예 없다."""
+    NONE = "None"
+
+    def __init__(self):
+        import nodes
+        self._h, self._l = nodes.LoraLoaderModelOnly(), nodes.LoraLoaderModelOnly()   # 파일 캐시가 칸마다 따로
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        names = [cls.NONE] + folder_paths.get_filename_list("loras")
+        strength = ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05})
+        return {"required": {"model_high": ("MODEL",), "model_low": ("MODEL",),
+                             "lora_high": (names, {"tooltip": "HIGH(노이즈 큰 앞 단계) 모델에 걸 파일. None = 안 씀"}),
+                             "strength_high": strength,
+                             "lora_low": (names, {"tooltip": "LOW(마무리 단계) 모델에 걸 파일. None = 안 씀"}),
+                             "strength_low": strength}}
+
+    RETURN_TYPES = ("MODEL", "MODEL")
+    RETURN_NAMES = ("model_high", "model_low")
+    FUNCTION = "run"
+    CATEGORY = "endo/wan"
+
+    def _one(self, loader, model, name, strength):
+        if name == self.NONE or not name or strength == 0:
+            return model
+        return loader.load_lora_model_only(model, name, strength)[0]
+
+    def run(self, model_high, model_low, lora_high, strength_high, lora_low, strength_low):
+        return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
+
+
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoLoadFrames": VideoLoadFrames,
                        "DepthStats": DepthStats, "FrameSeqWrite": FrameSeqWrite, "FrameSeqVideo": FrameSeqVideo,
                        "DepthPadSettings": DepthPadSettings, "DepthNormalizeChained": DepthNormalizeChained}
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
+                              "WanLoraPair": "WAN LoRA 쌍 (HIGH·LOW 파일 + 강도 각각)",
                               "FrameContactSheet": "프레임 접촉 시트 (번호 표시)",
                               "AnchorPick": "앵커 고르기·고정 (번호 → 보관, lock 이면 후보 생성 생략)",
                               "DepthPadExtend": "Depth 패딩 (가장자리 복제, 아웃페인트용)",
