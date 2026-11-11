@@ -4,6 +4,8 @@ FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (�
 
 WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
 
+VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
+
 AnchorPick — 후보 영상에서 번호로 앵커를 고르고 파일로 보관. lock=켜면 보관본을 쓰고 후보 영상 입력을
   아예 요청하지 않는다(지연 입력) → 후보 생성이 다시 돌지 않음. WAN 생성은 같은 시드여도 실행마다 달라지므로
   (실측 PSNR ~21dB) 캐시가 비워진 뒤 재생성하면 같은 번호가 다른 그림이 된다 — 고른 앵커를 고정하는 장치.
@@ -357,6 +359,29 @@ class VideoRetimeSettings:
                  "dup_center": dup_time.startswith("가운데"), "interp_model": interp_model},)
 
 
+class VideoInfo:
+    """영상의 원래 크기·fps·프레임 수·소리 유무 — 디코딩 없이 컨테이너 정보만."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",)}}
+
+    RETURN_TYPES = ("INT", "INT", "FLOAT", "INT", "BOOLEAN")
+    RETURN_NAMES = ("width", "height", "fps", "frames", "has_audio")
+    FUNCTION = "run"
+    CATEGORY = "endo/video"
+
+    def run(self, video):
+        import av
+        src = video.get_stream_source()
+        if hasattr(src, "seek"): src.seek(0)
+        with av.open(src, mode="r") as c:
+            vs = c.streams.video[0]
+            fps = float(vs.average_rate or vs.guessed_rate or 16)
+            n = vs.frames or (int(round(float(vs.duration * vs.time_base) * fps)) if vs.duration else
+                              int(round(c.duration / 1e6 * fps)) if c.duration else 0)
+            return (vs.codec_context.width, vs.codec_context.height, fps, int(n), len(c.streams.audio) > 0)
+
+
 class VideoClipInfo:
     """클립 전체를 축소본으로만 훑어 목표 프레임 수·로드 크기·진단을 낸다(원본 크기 프레임은 보관 안 함)."""
     @classmethod
@@ -517,9 +542,37 @@ def _encode_mp4(frames, n, fps, path):
         for p in s.encode(): c.mux(p)
 
 
+def _mux_audio(path, src):
+    """path(영상만) 에 src 영상의 첫 소리 트랙을 그대로(재인코딩 없이) 붙인다. 영상 길이를 넘는 소리는 버림.
+    소리가 없으면 아무것도 안 하고 False."""
+    import av, heapq, os
+    if hasattr(src, "seek"): src.seek(0)
+    with av.open(src, mode="r") as a:
+        if not a.streams.audio: return False
+    if hasattr(src, "seek"): src.seek(0)
+    tmp = path + ".noaudio.mp4"
+    os.replace(path, tmp)
+    with av.open(tmp, mode="r") as v, av.open(src, mode="r") as a, av.open(path, mode="w") as out:
+        vi, ai = v.streams.video[0], a.streams.audio[0]
+        vo, ao = out.add_stream_from_template(vi), out.add_stream_from_template(ai)
+        end = float(vi.duration * vi.time_base) if vi.duration else (v.duration / 1e6 if v.duration else None)
+        def packets(c, st, o):
+            for p in c.demux(st):
+                if p.dts is None: continue
+                t = float(p.dts * st.time_base)
+                if o is ao and end is not None and p.pts is not None and float(p.pts * st.time_base) >= end: return
+                yield t, id(o), p, o
+        for _, _, p, o in heapq.merge(packets(v, vi, vo), packets(a, ai, ao), key=lambda x: (x[0], x[1])):
+            p.stream = o
+            out.mux(p)
+    os.remove(tmp)
+    return True
+
+
 class FrameSeqVideo:
     """영상 저장 + 미리보기. lock 켬 = 파트 루프가 디스크에 쓴 프레임(seq_dir)을 이어 인코딩 / lock 끔 = images(앵커 후보 등).
-    지연 입력이라 선택 안 된 쪽은 실행 자체가 안 됨 → lock 끔이면 본 루프가, 켬이면 후보 생성이 돌지 않는다."""
+    지연 입력이라 선택 안 된 쪽은 실행 자체가 안 됨 → lock 끔이면 본 루프가, 켬이면 후보 생성이 돌지 않는다.
+    audio_from 을 이으면 그 영상의 소리 트랙을 재인코딩 없이 붙인다(영상 길이까지)."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -533,6 +586,7 @@ class FrameSeqVideo:
         }, "optional": {
             "images": ("IMAGE", {"lazy": True}),
             "seq_dir": ("STRING", {"lazy": True, "forceInput": True}),
+            "audio_from": ("VIDEO", {"tooltip": "이 영상의 소리를 그대로 붙임 (없으면 소리 없이)"}),
         }}
 
     RETURN_TYPES = ("STRING",)
@@ -541,10 +595,12 @@ class FrameSeqVideo:
     FUNCTION = "run"
     CATEGORY = "endo/video"
 
-    def check_lazy_status(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None):
+    def check_lazy_status(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None,
+                          audio_from=None):
         return ["seq_dir"] if lock else ["images"]
 
-    def run(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None):
+    def run(self, lock, fps, total, filename_prefix, filename_prefix_unlocked, kind, save_output, images=None, seq_dir=None,
+            audio_from=None):
         import os, folder_paths
         from PIL import Image
         if lock:
@@ -562,6 +618,8 @@ class FrameSeqVideo:
         file = f"{fname}_{counter:05}.mp4"
         path = os.path.join(out_dir, file)
         _encode_mp4(frames, n, fps, path)
+        if audio_from is not None:
+            _mux_audio(path, audio_from.get_stream_source())
         return {"ui": {"images": [{"filename": file, "subfolder": sub, "type": "output" if save_output else "temp"}], "animated": (True,)},
                 "result": (path,)}
 
@@ -715,7 +773,7 @@ class WanLoraPair:
 NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
-                       "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoLoadFrames": VideoLoadFrames,
+                       "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "VideoLoadFrames": VideoLoadFrames,
                        "DepthStats": DepthStats, "FrameSeqWrite": FrameSeqWrite, "FrameSeqVideo": FrameSeqVideo,
                        "DepthPadSettings": DepthPadSettings, "DepthNormalizeChained": DepthNormalizeChained}
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
@@ -727,6 +785,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규�
                               "VideoLoadRetime": "영상 → 일정 fps (저fps·가변fps·중복 복원)",
                               "VideoRetimeSettings": "원본 프레임 복원 설정",
                               "VideoClipInfo": "클립 스캔 (프레임 수·로드 크기·진단)",
+                              "VideoInfo": "영상 정보 (원래 크기·fps·프레임 수·소리 유무)",
                               "VideoLoadFrames": "클립 구간 로드 (프레임 번호 범위 — 파트 루프용)",
                               "DepthStats": "Depth 정규화 기준 (클립 전체 표본)",
                               "FrameSeqWrite": "프레임 파일로 쓰기 (파트 결과, RAM 누적 없음)",
