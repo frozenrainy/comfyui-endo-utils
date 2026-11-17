@@ -5,6 +5,7 @@ FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (�
 WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
 
 VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
+KeepOnce — 한 실행 안에서 앞 노드를 한 번만 계산(--cache-none 의 루프에서 루프 밖 모델·결과가 구간마다 다시 계산되는 것을 막음).
 FrameSeqCheck · FrameSeqWrite(where=output) — 이어서 하기: 프레임을 출력 폴더에 남기고, 다시 실행하면 이미 있는 조각은 건너뜀.
   프레임은 다 쓴 뒤에만 이름이 붙고(.tmp → 바꿈), 같은 이름에 다른 작업 흔적이 있으면 멈춘다. FrameSeqVideo cleanup — 끝나면 지움.
 
@@ -813,6 +814,49 @@ class AnchorPick:
         return (anchor, sheet)
 
 
+class _AnyType(str):
+    """Matches every type in link validation (the usual custom-node idiom)."""
+    def __ne__(self, other):
+        return False
+
+
+ANY = _AnyType("*")
+
+
+class KeepOnce:
+    """한 실행 안에서 앞 노드를 한 번만 계산 — --cache-none 의 루프용.
+    --cache-none 은 결과를 쓰고 버렸다가 다시 필요하면 앞 노드부터 다시 계산한다. 루프 밖 결과(모델·편집된 첫 프레임·영상 정보)를
+    루프 안 구간이 쓸 때마다 그렇게 되어, 81장 구간마다 Qwen 편집(3분)이 2~5번 다시 돌았다(11-17). 이 노드는 처음 받은 값을 이 실행의
+    DynamicPrompt 에 붙여 기억하고, 다시 불리면 입력을 요청하지 않아(지연 입력) 앞 노드가 아예 실행되지 않는다. 실행이 끝나
+    DynamicPrompt 가 사라지면 기억도 함께 풀린다."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}, "optional": {"value": (ANY, {"lazy": True})},
+                "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
+
+    RETURN_TYPES = (ANY,)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "run"
+    CATEGORY = "endo/utils"
+
+    @staticmethod
+    def _memo(dynprompt):
+        memo = getattr(dynprompt, "_endo_keep_once", None)
+        if memo is None:
+            memo = {}
+            setattr(dynprompt, "_endo_keep_once", memo)
+        return memo
+
+    def check_lazy_status(self, value=None, dynprompt=None, unique_id=None):
+        return [] if unique_id in self._memo(dynprompt) else ["value"]
+
+    def run(self, value=None, dynprompt=None, unique_id=None):
+        memo = self._memo(dynprompt)
+        if unique_id not in memo:
+            memo[unique_id] = value
+        return (memo[unique_id],)
+
+
 class WanLoraPair:
     """WAN 2.2 LoRA 한 쌍 — HIGH 모델엔 HIGH 파일, LOW 모델엔 LOW 파일을 각자 강도로. WAN 2.2 LoRA 는 대부분
     HIGH/LOW 두 파일이라 한 줄에 같이 둔다. 파일이 None 이거나 강도 0 이면 그쪽은 건드리지 않음(파일도 안 읽음).
@@ -848,7 +892,7 @@ class WanLoraPair:
         return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "FrameContactSheet": FrameContactSheet,
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
@@ -856,6 +900,7 @@ NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraP
                        "DepthPadSettings": DepthPadSettings, "DepthNormalizeChained": DepthNormalizeChained}
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
                               "WanLoraPair": "WAN LoRA 쌍 (HIGH·LOW 파일 + 강도 각각)",
+                              "KeepOnce": "한 번만 계산 (실행 안에서 · --cache-none 루프용)",
                               "FrameContactSheet": "프레임 접촉 시트 (번호 표시)",
                               "AnchorPick": "앵커 고르기·고정 (번호 → 보관, lock 이면 후보 생성 생략)",
                               "DepthPadExtend": "Depth 패딩 (가장자리 복제, 아웃페인트용)",
