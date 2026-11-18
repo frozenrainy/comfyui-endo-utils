@@ -5,6 +5,7 @@ FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (�
 WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
 
 VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
+SegformerMask — 옷·부위 마스크(segformer_b3_clothes 등). Easy-Use humanSegmentation 과 같은 계산을 GPU 묶음으로(그쪽은 CPU·한 장씩).
 KeepOnce — 한 실행 안에서 앞 노드를 한 번만 계산(--cache-none 의 루프에서 루프 밖 모델·결과가 구간마다 다시 계산되는 것을 막음).
 FrameSeqCheck · FrameSeqWrite(where=output) — 이어서 하기: 프레임을 출력 폴더에 남기고, 다시 실행하면 이미 있는 조각은 건너뜀.
   프레임은 다 쓴 뒤에만 이름이 붙고(.tmp → 바꿈), 같은 이름에 다른 작업 흔적이 있으면 멈춘다. FrameSeqVideo cleanup — 끝나면 지움.
@@ -899,6 +900,82 @@ class KeepOnce:
         return (memo[unique_id],)
 
 
+_SEG_MEAN, _SEG_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+_SEG_MODELS = {}
+
+
+def _segformer_load(path):
+    if path not in _SEG_MODELS:
+        from transformers import AutoModelForSemanticSegmentation
+        _SEG_MODELS.clear()                                 # 한 가지만 들고 있음
+        _SEG_MODELS[path] = AutoModelForSemanticSegmentation.from_pretrained(path).eval()
+    return _SEG_MODELS[path]
+
+
+def _segformer_masks(images, model, classes, batch=8, device="cpu", dtype=None, size=512):
+    """images (B,H,W,3) 0~1 → mask (B,H,W) 0/1. Easy-Use humanSegmentation(segformer) 과 같은 계산을 GPU 묶음으로:
+    PIL 변환(255 곱해 버림) → PIL 512×512 bilinear(전처리기와 같음) → /255 · ImageNet 정규화 → 로짓을 원래 크기로 bilinear →
+    argmax → 고른 클래스. 전처리만 CPU(한 장 수 ms), 모델은 묶음."""
+    import torch.nn.functional as F
+    from PIL import Image
+    B, H, W, _ = images.shape
+    mean = torch.tensor(_SEG_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(_SEG_STD, device=device).view(1, 3, 1, 1)
+    cls = torch.tensor(sorted(set(classes)), device=device)
+    out = torch.empty((B, H, W), dtype=torch.float32)
+    u8 = np.clip(255.0 * images.cpu().numpy(), 0, 255).astype(np.uint8)
+    with torch.inference_mode():
+        for i in range(0, B, batch):
+            x = np.stack([np.asarray(Image.fromarray(f).resize((size, size), resample=Image.BILINEAR)) for f in u8[i:i + batch]])
+            x = torch.from_numpy(x).to(device).movedim(-1, 1).float()
+            x = ((x * (1.0 / 255.0) - mean) / std).to(dtype or torch.float32)
+            logits = model(pixel_values=x).logits.float()
+            logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
+            out[i:i + batch] = torch.isin(logits.argmax(dim=1), cls).float().cpu()
+    return out
+
+
+class SegformerMask:
+    """사람 옷·부위 마스크(segformer, 예: segformer_b3_clothes) — Easy-Use humanSegmentation 의 segformer 와 같은 결과를 GPU 에서 묶음으로.
+    Easy-Use 판은 모델을 CPU 에 두고 한 장씩 돌려 81장에 80~170초였다(11-18, ④ 구간당 두 번 → 구간 13분 중 5분).
+    이 노드: 같은 81장(560×944) GPU fp32 6초, Easy-Use 결과와 다른 화소 0.002~0.03%(IoU 0.998~0.999 — 경계 몇 화소)."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": ("IMAGE",),
+            "model": ("STRING", {"default": "segformer_b3_clothes", "tooltip": "models 폴더 아래 폴더 이름 (transformers 형식)"}),
+            "classes": ("STRING", {"default": "4", "tooltip": "쉼표로: 0 배경 · 1 모자 · 2 머리카락 · 4 상의 · 5 치마 · 6 바지 · 7 원피스 · 8 벨트 · 11 얼굴 · 14/15 팔 · 16 가방 · 17 스카프"}),
+            "batch": ("INT", {"default": 8, "min": 1, "max": 16, "tooltip": "16 까지 시험함(ROCm 7.2 fp32 행렬곱은 2^19 행부터 0 — 묶음을 키우지 말 것). 키워도 빨라지지 않음"}),
+            "precision": (["fp32", "bf16"], {"default": "fp32", "tooltip": "fp32 = CPU 와 같은 결과 · bf16 = 더 빠르나 프로세스마다 첫 호출 50초(커널 탐색). fp16 은 빈 마스크가 나와 뺐다"}),
+        }}
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "run"
+    CATEGORY = "endo/utils"
+
+    def run(self, image, model, classes, batch, precision):
+        import os
+        import folder_paths
+        import comfy.model_management as mm
+        path = os.path.join(folder_paths.models_dir, model)
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"segformer 모델 폴더가 없음: {path}")
+        want = [int(c) for c in str(classes).replace(" ", "").split(",") if c != ""]
+        if not want:
+            raise ValueError("classes 가 비었음 (예: 4 또는 1,4)")
+        dev = mm.get_torch_device()
+        dt = torch.bfloat16 if precision == "bf16" and dev.type != "cpu" else torch.float32
+        m = _segformer_load(path)
+        m.to(device=dev, dtype=dt)
+        try:
+            mask = _segformer_masks(image, m, want, batch, dev, dt)
+        finally:
+            m.to(device="cpu", dtype=torch.float32)          # 쓸 때만 GPU (190MB)
+            mm.soft_empty_cache()
+        return (mask,)
+
+
 class WanLoraPair:
     """WAN 2.2 LoRA 한 쌍 — HIGH 모델엔 HIGH 파일, LOW 모델엔 LOW 파일을 각자 강도로. WAN 2.2 LoRA 는 대부분
     HIGH/LOW 두 파일이라 한 줄에 같이 둔다. 파일이 None 이거나 강도 0 이면 그쪽은 건드리지 않음(파일도 안 읽음).
@@ -934,7 +1011,7 @@ class WanLoraPair:
         return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "FrameContactSheet": FrameContactSheet,
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
@@ -943,6 +1020,7 @@ NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraP
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
                               "WanLoraPair": "WAN LoRA 쌍 (HIGH·LOW 파일 + 강도 각각)",
                               "KeepOnce": "한 번만 계산 (실행 안에서 · --cache-none 루프용)",
+                              "SegformerMask": "옷·부위 마스크 (segformer · GPU 묶음)",
                               "FrameContactSheet": "프레임 접촉 시트 (번호 표시)",
                               "AnchorPick": "앵커 고르기·고정 (번호 → 보관, lock 이면 후보 생성 생략)",
                               "DepthPadExtend": "Depth 패딩 (가장자리 복제, 아웃페인트용)",
