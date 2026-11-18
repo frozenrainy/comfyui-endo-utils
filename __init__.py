@@ -6,6 +6,7 @@ WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). N
 
 VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
 SegformerMask — 옷·부위 마스크(segformer_b3_clothes 등). Easy-Use humanSegmentation 과 같은 계산을 GPU 묶음으로(그쪽은 CPU·한 장씩).
+MaskBBox — 마스크 묶음 합집합을 감싸는 상자(여백·16 배수·최소 크기) → 대상 주변만 잘라 처리하고 제자리에 붙이기.
 KeepOnce — 한 실행 안에서 앞 노드를 한 번만 계산(--cache-none 의 루프에서 루프 밖 모델·결과가 구간마다 다시 계산되는 것을 막음).
 FrameSeqCheck · FrameSeqWrite(where=output) — 이어서 하기: 프레임을 출력 폴더에 남기고, 다시 실행하면 이미 있는 조각은 건너뜀.
   프레임은 다 쓴 뒤에만 이름이 붙고(.tmp → 바꿈), 같은 이름에 다른 작업 흔적이 있으면 멈춘다. FrameSeqVideo cleanup — 끝나면 지움.
@@ -976,6 +977,56 @@ class SegformerMask:
         return (mask,)
 
 
+def _mask_bbox(mask, margin=64, align=16, min_size=256, threshold=0.5):
+    """mask (B,H,W) → 모든 프레임 합집합의 상자 (x, y, w, h): 여백을 두고, 폭·높이는 align 배수(최소 min_size), 프레임 안으로.
+    대상이 없으면 프레임 전체."""
+    B, H, W = mask.shape
+    on = (mask > threshold).any(dim=0)
+    ys, xs = torch.nonzero(on, as_tuple=True)
+    if len(xs) == 0:
+        return 0, 0, W, H
+    x0, x1 = max(0, int(xs.min()) - margin), min(W, int(xs.max()) + 1 + margin)
+    y0, y1 = max(0, int(ys.min()) - margin), min(H, int(ys.max()) + 1 + margin)
+
+    def side(a0, a1, full):
+        n = max(a1 - a0, min(min_size, full))
+        n = min(-(-n // align) * align, full - full % align)       # align 배수로 올림, 프레임을 넘지 않게
+        c = (a0 + a1) / 2                                          # 가운데를 지키며 늘리고, 밖으로 나가면 안으로 민다
+        a = int(round(c - n / 2))
+        return max(0, min(a, full - n)), n
+
+    x, w = side(x0, x1, W)
+    y, h = side(y0, y1, H)
+    return x, y, w, h
+
+
+class MaskBBox:
+    """마스크 묶음(구간 전체) 합집합을 감싸는 상자 — 대상 주변만 잘라 처리하고 원래 자리에 붙이기용(ImageCrop · CropMask ·
+    ImageCompositeMasked 의 x·y). 구간 안에서는 상자가 하나라 영상이 흔들리지 않는다. enabled=끔 이면 프레임 전체.
+    11-18 시험(모자 지우기, 560×944 → 368×304 1:1): 27 → 18분, 결과 문제없음."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "mask": ("MASK",),
+            "enabled": ("BOOLEAN", {"default": True}),
+            "margin": ("INT", {"default": 64, "min": 0, "max": 1024, "tooltip": "대상 둘레 여백 px — 주변을 보고 그려야 자연스럽다"}),
+            "align": ("INT", {"default": 16, "min": 1, "max": 128, "tooltip": "폭·높이 배수 (WAN = 16)"}),
+            "min_size": ("INT", {"default": 256, "min": 16, "max": 4096, "tooltip": "폭·높이 최소 px — 너무 작으면 생성 품질이 떨어진다"}),
+        }}
+
+    RETURN_TYPES = ("INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("x", "y", "width", "height")
+    FUNCTION = "run"
+    CATEGORY = "endo/utils"
+
+    def run(self, mask, enabled, margin, align, min_size):
+        if mask.dim() == 2:
+            mask = mask[None]
+        if not enabled:
+            return (0, 0, int(mask.shape[2]), int(mask.shape[1]))
+        return _mask_bbox(mask, margin, align, min_size)
+
+
 class WanLoraPair:
     """WAN 2.2 LoRA 한 쌍 — HIGH 모델엔 HIGH 파일, LOW 모델엔 LOW 파일을 각자 강도로. WAN 2.2 LoRA 는 대부분
     HIGH/LOW 두 파일이라 한 줄에 같이 둔다. 파일이 None 이거나 강도 0 이면 그쪽은 건드리지 않음(파일도 안 읽음).
@@ -1011,7 +1062,7 @@ class WanLoraPair:
         return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "FrameContactSheet": FrameContactSheet,
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "MaskBBox": MaskBBox, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
@@ -1021,6 +1072,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규�
                               "WanLoraPair": "WAN LoRA 쌍 (HIGH·LOW 파일 + 강도 각각)",
                               "KeepOnce": "한 번만 계산 (실행 안에서 · --cache-none 루프용)",
                               "SegformerMask": "옷·부위 마스크 (segformer · GPU 묶음)",
+                              "MaskBBox": "마스크 둘레 상자 (구간 합집합 · 여백 · 16 배수)",
                               "FrameContactSheet": "프레임 접촉 시트 (번호 표시)",
                               "AnchorPick": "앵커 고르기·고정 (번호 → 보관, lock 이면 후보 생성 생략)",
                               "DepthPadExtend": "Depth 패딩 (가장자리 복제, 아웃페인트용)",
