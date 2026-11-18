@@ -20,5 +20,9 @@ assert execute(p1, "7", prod("b")) == "result-a"            # same prompt, same 
 assert execute(p1, "8", prod("c")) == "result-c"            # another KeepOnce node keeps its own value
 assert execute(p2, "7", prod("d")) == "result-d"            # a new prompt starts afresh
 assert calls == ["a", "c", "d"], calls
+m._keep_once_release()                                     # end of run: memories dropped, even while the prompt object lives
+assert execute(p1, "7", prod("e")) == "result-e"
+assert calls == ["a", "c", "d", "e"], calls
+assert not m._KEEP_ONCE_RELEASE_HOOKED                     # no ComfyUI here: hook absent, node still works
 assert not (m.ANY != "MODEL") and not (m.ANY != "IMAGE")
 print("ok", m.NODE_DISPLAY_NAME_MAPPINGS["KeepOnce"])

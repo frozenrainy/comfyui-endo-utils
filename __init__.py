@@ -823,12 +823,53 @@ class _AnyType(str):
 ANY = _AnyType("*")
 
 
+_KEEP_ONCE_LIVE = []                                        # 이번 실행의 KeepOnce 기억들 (실행이 끝나면 비움)
+
+
+def _keep_once_release(*_):
+    for memo in _KEEP_ONCE_LIVE:
+        memo.clear()
+    _KEEP_ONCE_LIVE.clear()
+
+
+def _register_keep_once_release():
+    """실행 시작·끝 알림을 받는 길은 캐시 제공자 API 뿐이다(0.41). 외부 캐시는 하지 않는다(should_cache=False)."""
+    try:
+        from comfy_execution.cache_provider import register_cache_provider
+        from comfy_api.latest._caching import CacheProvider
+    except Exception:                                       # 이 API 가 없는 판: 예전처럼 다음 실행 때 풀림
+        return False
+
+    class _KeepOnceRelease(CacheProvider):
+        async def on_lookup(self, context):
+            return None
+
+        async def on_store(self, context, value):
+            return None
+
+        def should_cache(self, context, value=None):
+            return False
+
+        def on_prompt_start(self, prompt_id):
+            _keep_once_release()
+
+        def on_prompt_end(self, prompt_id):
+            _keep_once_release()
+
+    register_cache_provider(_KeepOnceRelease())
+    return True
+
+
+_KEEP_ONCE_RELEASE_HOOKED = _register_keep_once_release()
+
+
 class KeepOnce:
     """한 실행 안에서 앞 노드를 한 번만 계산 — --cache-none 의 루프용.
     --cache-none 은 결과를 쓰고 버렸다가 다시 필요하면 앞 노드부터 다시 계산한다. 루프 밖 결과(모델·편집된 첫 프레임·영상 정보)를
     루프 안 구간이 쓸 때마다 그렇게 되어, 81장 구간마다 Qwen 편집(3분)이 2~5번 다시 돌았다(11-17). 이 노드는 처음 받은 값을 이 실행의
-    DynamicPrompt 에 붙여 기억하고, 다시 불리면 입력을 요청하지 않아(지연 입력) 앞 노드가 아예 실행되지 않는다. 실행이 끝나
-    DynamicPrompt 가 사라지면 기억도 함께 풀린다."""
+    DynamicPrompt 에 붙여 기억하고, 다시 불리면 입력을 요청하지 않아(지연 입력) 앞 노드가 아예 실행되지 않는다.
+    기억은 실행이 끝날 때 비운다(_KeepOnceRelease). DynamicPrompt 는 진행 표시 레지스트리가 다음 실행 시작까지 쥐고 있어, 그에
+    맡기면 실행 뒤 gc 를 지나 VACE 모델 둘(37GB)이 남고 다음 실행이 스왑으로 시작했다(11-18: 같은 작업 13분 → 24분)."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {}, "optional": {"value": (ANY, {"lazy": True})},
@@ -845,6 +886,7 @@ class KeepOnce:
         if memo is None:
             memo = {}
             setattr(dynprompt, "_endo_keep_once", memo)
+            _KEEP_ONCE_LIVE.append(memo)
         return memo
 
     def check_lazy_status(self, value=None, dynprompt=None, unique_id=None):
