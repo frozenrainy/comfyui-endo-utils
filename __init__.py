@@ -2,6 +2,7 @@
 
 FrameContactSheet — 영상 프레임을 번호 붙인 격자 한 장으로 (앵커 프레임 번호 고르기용).
 
+LoraOptional — LoRA 한 칸, None 이면 안 씀(기본 LoRA 노드는 파일을 꼭 골라야 함).
 WanLoraPair — WAN 2.2 LoRA 한 쌍(HIGH 파일·LOW 파일 + 강도 각각). None 이나 강도 0 이면 그쪽은 파일도 안 읽음.
 
 VideoInfo — 영상의 원래 크기·fps·프레임 수·소리 유무(디코딩 없이). FrameSeqVideo 의 audio_from — 원본 소리를 그대로 붙임.
@@ -1027,6 +1028,34 @@ class MaskBBox:
         return _mask_bbox(mask, margin, align, min_size)
 
 
+class LoraOptional:
+    """LoRA 한 칸, 비워 둘 수 있음 — 기본 LoraLoaderModelOnly 는 파일을 꼭 골라야 해서 '안 씀' 칸을 만들 수 없다.
+    None 이거나 강도 0 이면 모델을 그대로 넘김(파일도 안 읽음). Z-Image Turbo 등 한 파일짜리 LoRA 용(WAN 2.2 쌍은 WanLoraPair).
+    11-19: Z-Image Turbo 에 붙는 것 확인 — 키 경고 0, 강도 0 = LoRA 없음과 화소 동일, 강도 1 = 눈에 띄게 달라짐."""
+    NONE = "None"
+
+    def __init__(self):
+        import nodes
+        self._loader = nodes.LoraLoaderModelOnly()
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        return {"required": {"model": ("MODEL",),
+                             "lora": ([cls.NONE] + folder_paths.get_filename_list("loras"), {"tooltip": "None = 안 씀"}),
+                             "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05})}}
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "run"
+    CATEGORY = "endo/utils"
+
+    def run(self, model, lora, strength):
+        if lora == self.NONE or not lora or strength == 0:
+            return (model,)
+        return (self._loader.load_lora_model_only(model, lora, strength)[0],)
+
+
 class WanLoraPair:
     """WAN 2.2 LoRA 한 쌍 — HIGH 모델엔 HIGH 파일, LOW 모델엔 LOW 파일을 각자 강도로. WAN 2.2 LoRA 는 대부분
     HIGH/LOW 두 파일이라 한 줄에 같이 둔다. 파일이 None 이거나 강도 0 이면 그쪽은 건드리지 않음(파일도 안 읽음).
@@ -1062,7 +1091,7 @@ class WanLoraPair:
         return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "MaskBBox": MaskBBox, "FrameContactSheet": FrameContactSheet,
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "LoraOptional": LoraOptional, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "MaskBBox": MaskBBox, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
@@ -1070,6 +1099,7 @@ NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraP
                        "DepthPadSettings": DepthPadSettings, "DepthNormalizeChained": DepthNormalizeChained}
 NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규화 (클립 전체, VACE용)",
                               "WanLoraPair": "WAN LoRA 쌍 (HIGH·LOW 파일 + 강도 각각)",
+                              "LoraOptional": "LoRA 한 칸 (None = 안 씀)",
                               "KeepOnce": "한 번만 계산 (실행 안에서 · --cache-none 루프용)",
                               "SegformerMask": "옷·부위 마스크 (segformer · GPU 묶음)",
                               "MaskBBox": "마스크 둘레 상자 (구간 합집합 · 여백 · 16 배수)",

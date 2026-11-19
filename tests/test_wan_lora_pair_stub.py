@@ -17,3 +17,12 @@ assert n.run("H", "L", "None", 1.0, "a_LOW.safetensors", 0.0) == ("H", "L") and 
 assert n.run("H", "L", "a_HIGH.safetensors", 1.0, "None", 1.0) == ("H+a_HIGH.safetensors@1.0", "L")
 assert n._h is not n._l
 print("ok", m.NODE_DISPLAY_NAME_MAPPINGS["WanLoraPair"])
+# LoraOptional: one slot that may stay empty
+O = m.LoraOptional
+assert O.INPUT_TYPES()["required"]["lora"][0][0] == "None"
+calls.clear()
+o = O()
+assert o.run("Z", "a_HIGH.safetensors", 0.7) == ("Z+a_HIGH.safetensors@0.7",) and calls == [("Z", "a_HIGH.safetensors", 0.7)]
+calls.clear()
+assert o.run("Z", "None", 1.0) == ("Z",) and o.run("Z", "a_HIGH.safetensors", 0) == ("Z",) and calls == []
+print("ok", m.NODE_DISPLAY_NAME_MAPPINGS["LoraOptional"])
