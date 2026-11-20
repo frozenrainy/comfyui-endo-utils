@@ -914,17 +914,16 @@ def _segformer_load(path):
     return _SEG_MODELS[path]
 
 
-def _segformer_masks(images, model, classes, batch=8, device="cpu", dtype=None, size=512):
-    """images (B,H,W,3) 0~1 → mask (B,H,W) 0/1. Easy-Use humanSegmentation(segformer) 과 같은 계산을 GPU 묶음으로:
+def _segformer_labels(images, model, batch=8, device="cpu", dtype=None, size=512):
+    """images (B,H,W,3) 0~1 → 클래스 번호 (B,H,W) uint8. Easy-Use humanSegmentation(segformer) 과 같은 계산을 GPU 묶음으로:
     PIL 변환(255 곱해 버림) → PIL 512×512 bilinear(전처리기와 같음) → /255 · ImageNet 정규화 → 로짓을 원래 크기로 bilinear →
-    argmax → 고른 클래스. 전처리만 CPU(한 장 수 ms), 모델은 묶음."""
+    argmax. 전처리만 CPU(한 장 수 ms), 모델은 묶음."""
     import torch.nn.functional as F
     from PIL import Image
     B, H, W, _ = images.shape
     mean = torch.tensor(_SEG_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(_SEG_STD, device=device).view(1, 3, 1, 1)
-    cls = torch.tensor(sorted(set(classes)), device=device)
-    out = torch.empty((B, H, W), dtype=torch.float32)
+    out = torch.empty((B, H, W), dtype=torch.uint8)
     u8 = np.clip(255.0 * images.cpu().numpy(), 0, 255).astype(np.uint8)
     with torch.inference_mode():
         for i in range(0, B, batch):
@@ -933,8 +932,45 @@ def _segformer_masks(images, model, classes, batch=8, device="cpu", dtype=None, 
             x = ((x * (1.0 / 255.0) - mean) / std).to(dtype or torch.float32)
             logits = model(pixel_values=x).logits.float()
             logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-            out[i:i + batch] = torch.isin(logits.argmax(dim=1), cls).float().cpu()
+            out[i:i + batch] = logits.argmax(dim=1).to(torch.uint8).cpu()
     return out
+
+
+def _segformer_masks(images, model, classes, batch=8, device="cpu", dtype=None, size=512):
+    """images (B,H,W,3) 0~1 → mask (B,H,W) 0/1 — 고른 클래스."""
+    lab = _segformer_labels(images, model, batch, device, dtype, size)
+    return torch.isin(lab, torch.tensor(sorted(set(classes)), dtype=torch.uint8)).float()
+
+
+# segformer_b3_clothes 는 같은 옷을 프레임마다 다르게 부른다 — 11-20 흰 크롭탑+치마 시험 영상: 상의 4 ↔ 원피스 7 이 프레임마다
+# 바뀌어 7 만 고르면 표본 48장 중 18장이 빈 마스크(→ 그 프레임은 원본 옷 그대로). 원피스로 불릴 땐 아래쪽이 치마 5 로도 나뉜다.
+_SEG_ALIKE = {4: (7,), 7: (4, 5)}
+_SEG_NAMES = {0: "배경", 1: "모자", 2: "머리카락", 3: "선글라스", 4: "상의", 5: "치마", 6: "바지", 7: "원피스", 8: "벨트", 9: "왼신발",
+              10: "오른신발", 11: "얼굴", 12: "왼다리", 13: "오른다리", 14: "왼팔", 15: "오른팔", 16: "가방", 17: "스카프"}
+_SEG_WEAR = (1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17)              # 점검 보고에 늘어놓을 옷·소품 (몸·배경 제외)
+
+
+def _seg_classes(classes, merge_alike=False):
+    """'7' → [7] · merge_alike 면 비슷하게 불리는 것까지 ('7' → [4, 5, 7], '4' → [4, 7])."""
+    want = [int(c) for c in str(classes).replace(" ", "").split(",") if c != ""]
+    if not want:
+        raise ValueError("classes 가 비었음 (예: 4 또는 1,4)")
+    got = set(want)
+    if merge_alike:
+        for c in want:
+            got.update(_SEG_ALIKE.get(c, ()))
+    return sorted(got)
+
+
+def _temporal_union(mask, radius):
+    """mask (B,H,W) → 프레임마다 앞뒤 radius 장의 합집합 — 한두 장에서 라벨이 튀어 빠진 자리를 메운다(구간 끝은 있는 만큼만)."""
+    if radius <= 0 or mask.shape[0] < 2:
+        return mask
+    import torch.nn.functional as F
+    B, H, W = mask.shape
+    x = mask.reshape(B, H * W).t()[None]                      # (1, HW, B) — 시간 축으로 max
+    x = F.max_pool1d(x, 2 * radius + 1, stride=1, padding=radius)
+    return x[0].t().reshape(B, H, W).contiguous()
 
 
 class SegformerMask:
@@ -949,6 +985,10 @@ class SegformerMask:
             "classes": ("STRING", {"default": "4", "tooltip": "쉼표로: 0 배경 · 1 모자 · 2 머리카락 · 4 상의 · 5 치마 · 6 바지 · 7 원피스 · 8 벨트 · 11 얼굴 · 14/15 팔 · 16 가방 · 17 스카프"}),
             "batch": ("INT", {"default": 8, "min": 1, "max": 16, "tooltip": "16 까지 시험함(ROCm 7.2 fp32 행렬곱은 2^19 행부터 0 — 묶음을 키우지 말 것). 키워도 빨라지지 않음"}),
             "precision": (["fp32", "bf16"], {"default": "fp32", "tooltip": "fp32 = CPU 와 같은 결과 · bf16 = 더 빠르나 프로세스마다 첫 호출 50초(커널 탐색). fp16 은 빈 마스크가 나와 뺐다"}),
+        }, "optional": {
+            "merge_alike": ("BOOLEAN", {"default": False, "tooltip": "켬 = 비슷하게 불리는 클래스도 함께 (4 상의 → +7 원피스 · 7 원피스 → +4 상의 +5 치마). "
+                                        "segformer 는 같은 옷을 프레임마다 4 ↔ 7 로 바꿔 부른다"}),
+            "temporal": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip": "앞뒤 몇 장의 마스크를 합칠까 (0 = 안 함) — 한두 장에서 빠진 자리를 메움"}),
         }}
 
     RETURN_TYPES = ("MASK",)
@@ -956,26 +996,134 @@ class SegformerMask:
     FUNCTION = "run"
     CATEGORY = "endo/utils"
 
-    def run(self, image, model, classes, batch, precision):
-        import os
-        import folder_paths
-        import comfy.model_management as mm
-        path = os.path.join(folder_paths.models_dir, model)
-        if not os.path.isdir(path):
-            raise FileNotFoundError(f"segformer 모델 폴더가 없음: {path}")
-        want = [int(c) for c in str(classes).replace(" ", "").split(",") if c != ""]
-        if not want:
-            raise ValueError("classes 가 비었음 (예: 4 또는 1,4)")
-        dev = mm.get_torch_device()
-        dt = torch.bfloat16 if precision == "bf16" and dev.type != "cpu" else torch.float32
-        m = _segformer_load(path)
-        m.to(device=dev, dtype=dt)
+    def run(self, image, model, classes, batch, precision, merge_alike=False, temporal=0):
+        m, dev, dt = _segformer_open(model, precision)
         try:
-            mask = _segformer_masks(image, m, want, batch, dev, dt)
+            mask = _segformer_masks(image, m, _seg_classes(classes, merge_alike), batch, dev, dt)
         finally:
-            m.to(device="cpu", dtype=torch.float32)          # 쓸 때만 GPU (190MB)
-            mm.soft_empty_cache()
-        return (mask,)
+            _segformer_close(m)
+        return (_temporal_union(mask, temporal),)
+
+
+def _segformer_open(model, precision="fp32"):
+    import os
+    import folder_paths
+    import comfy.model_management as mm
+    path = os.path.join(folder_paths.models_dir, model)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"segformer 모델 폴더가 없음: {path}")
+    dev = mm.get_torch_device()
+    dt = torch.bfloat16 if precision == "bf16" and dev.type != "cpu" else torch.float32
+    m = _segformer_load(path)
+    m.to(device=dev, dtype=dt)
+    return m, dev, dt
+
+
+def _segformer_close(m):
+    import comfy.model_management as mm
+    m.to(device="cpu", dtype=torch.float32)                  # 쓸 때만 GPU (190MB)
+    mm.soft_empty_cache()
+
+
+def _mask_check(labels, want, min_ratio=0.25, max_bad=0.10, floor=0.0005):
+    """labels (N,H,W) 표본 프레임의 클래스 번호 → (통과?, 프레임별 면적, 나쁜 프레임 번호들, 보고 줄들).
+    기준 = 면적 상위 10% 값(p90) — 대상이 잘 보이는 프레임의 크기. 그 min_ratio 배 미만(또는 floor 미만)인 프레임 = 빈 마스크로 셈.
+    11-20 실측(표본 48장): 크롭탑+치마 영상에 원피스 7 만 = 29장 · 4,7 = 0 · 모자 1 = 0 · 재킷 4 = 0."""
+    N = labels.shape[0]
+    on = torch.isin(labels, torch.tensor(want, dtype=labels.dtype))
+    area = on.float().mean(dim=(1, 2))
+    ref = float(torch.quantile(area, 0.9)) if N > 1 else float(area[0])
+    bad = [i for i in range(N) if float(area[i]) < max(floor, min_ratio * ref)]
+    ok = ref >= floor and len(bad) <= max_bad * N
+    pct = lambda v: f"{100 * v:.1f}%"
+    lines = [f"🎯 대상 클래스 {','.join(map(str, want))} — 표본 {N}장 (영상 전체에서 고르게)",
+             f"마스크 면적: 최소 {pct(area.min())} · 중앙 {pct(area.median())} · 최대 {pct(area.max())}",
+             f"빈(작은) 마스크 프레임: {len(bad)}/{N}장 (기준 = 상위 10% 면적 {pct(ref)} 의 {min_ratio:g} 배 미만)"]
+    seen = []
+    for c in _SEG_WEAR:
+        a = (labels == c).float().mean(dim=(1, 2))
+        n = int((a >= 0.01).sum())
+        if n:
+            seen.append((float(a.mean()), f"{c} {_SEG_NAMES[c]} 평균 {pct(a.mean())} ({n}/{N}장)"))
+    lines.append("이 영상에서 잡힌 옷·소품: " + (" · ".join(s for _, s in sorted(seen, reverse=True)) or "없음"))
+    if ok:
+        lines.insert(0, "✅ 마스크 점검 통과")
+    else:
+        lines.insert(0, "❌ 마스크 점검 실패 — 고른 대상이 많은 프레임에서 안 잡힌다. 그 프레임은 원래 옷 그대로 나온다.")
+        lines.append("고칠 것: '🎯 바꿀·지울 대상' 에 위 '잡힌 옷' 중 바꿀 옷의 번호를 모두 (예: 상의+치마 = 4,5). "
+                     "대상이 영상 중간에 정말 사라지는 영상이면 '🛑 마스크 점검' 을 끄고 다시.")
+    return ok, area, bad, lines
+
+
+def _mask_sheet(images, mask, area, bad, show=16, columns=8, thumb=160):
+    """표본 중 show 장(고르게 + 빈 마스크 프레임 우선)을 마스크 빨강 겹침으로 — 빈 마스크 프레임은 빨간 테두리."""
+    from PIL import Image, ImageDraw, ImageFont
+    N, H, W, _ = images.shape
+    flag = list(np.asarray(bad)[np.unique(np.linspace(0, len(bad) - 1, min(len(bad), show // 2)).round().astype(int))]) if bad else []
+    even = np.unique(np.linspace(0, N - 1, min(show - len(flag), N)).round().astype(int))
+    pick = sorted(set(int(i) for i in flag) | set(int(i) for i in even))[:show]
+    tw, th = thumb, max(1, round(H * thumb / W))
+    rows = math.ceil(len(pick) / columns)
+    sheet = Image.new("RGB", (min(columns, len(pick)) * tw, rows * th), (255, 255, 255))
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)
+    except OSError:
+        font = ImageFont.load_default(size=14)
+    draw = ImageDraw.Draw(sheet)
+    red = torch.tensor([1.0, 0.1, 0.1])
+    for j, i in enumerate(pick):
+        m = mask[i][..., None]
+        im = images[i].cpu().float() * (1 - 0.55 * m) + red * 0.55 * m
+        x, y = (j % columns) * tw, (j // columns) * th
+        sheet.paste(Image.fromarray((im.numpy() * 255).clip(0, 255).astype(np.uint8)).resize((tw, th), Image.LANCZOS), (x, y))
+        txt = f"#{i} {100 * float(area[i]):.0f}%"
+        box = draw.textbbox((x + 4, y + 2), txt, font=font)
+        draw.rectangle((box[0] - 3, box[1] - 2, box[2] + 3, box[3] + 2), fill=(0, 0, 0))
+        draw.text((x + 4, y + 2), txt, fill=(255, 255, 0), font=font)
+        if i in bad:
+            draw.rectangle((x + 1, y + 1, x + tw - 2, y + th - 2), outline=(255, 0, 0), width=4)
+    return torch.from_numpy(np.asarray(sheet, dtype=np.float32) / 255.0)[None]
+
+
+class SegformerMaskCheck:
+    """대상 마스크가 영상 내내 잡히는지 미리 점검 — 영상 전체에서 고르게 뽑은 프레임에 segformer 를 돌려,
+    고른 대상이 많은 프레임에서 비면 멈춘다(stop). 마스크가 빈 프레임은 원래 옷이 그대로 나오는데, 첫 프레임 편집(Qwen)은
+    마스크와 무관하게 프레임 전체를 바꾸므로 미리보기만 보면 성공처럼 보인다(11-20 시험: 0번만 새 옷, 1번부터 원래 옷).
+    through_* 는 그대로 내보낸다 — 뒤 단계를 이 노드 뒤에 걸어 점검이 먼저 돌게 하는 용도."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": ("IMAGE", {"tooltip": "표본 프레임들 (영상 전체에서 고르게 — 예: 48장)"}),
+            "model": ("STRING", {"default": "segformer_b3_clothes"}),
+            "classes": ("STRING", {"default": "4"}),
+            "merge_alike": ("BOOLEAN", {"default": False, "tooltip": "SegformerMask 와 같게"}),
+            "stop": ("BOOLEAN", {"default": True, "tooltip": "켬 = 점검 실패면 실행을 멈춤 (오래 그리기 전에)"}),
+            "min_ratio": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "상위 10% 면적의 몇 배 미만을 '빈 마스크' 로 셀까"}),
+            "max_bad": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "빈 마스크 프레임이 표본의 이 비율을 넘으면 실패"}),
+        }, "optional": {
+            "through_image": ("IMAGE",),
+            "through_value": (_AnyType("*"),),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE", _AnyType("*"))
+    RETURN_NAMES = ("sheet", "report", "through_image", "through_value")
+    FUNCTION = "run"
+    CATEGORY = "endo/utils"
+
+    def run(self, image, model, classes, merge_alike, stop, min_ratio, max_bad, through_image=None, through_value=None):
+        want = _seg_classes(classes, merge_alike)
+        m, dev, dt = _segformer_open(model)
+        try:
+            lab = _segformer_labels(image, m, 8, dev, dt)
+        finally:
+            _segformer_close(m)
+        ok, area, bad, lines = _mask_check(lab, want, min_ratio, max_bad)
+        report = "\n".join(lines)
+        print("[SegformerMaskCheck]\n" + report)
+        if not ok and stop:
+            raise ValueError(report)
+        on = torch.isin(lab, torch.tensor(want, dtype=lab.dtype)).float()
+        return (_mask_sheet(image, on, area, bad), report, through_image, through_value)
 
 
 def _mask_bbox(mask, margin=64, align=16, min_size=256, threshold=0.5):
@@ -1091,7 +1239,7 @@ class WanLoraPair:
         return (self._one(self._h, model_high, lora_high, strength_high), self._one(self._l, model_low, lora_low, strength_low))
 
 
-NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "LoraOptional": LoraOptional, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "MaskBBox": MaskBBox, "FrameContactSheet": FrameContactSheet,
+NODE_CLASS_MAPPINGS = {"DepthInverseNormalize": DepthInverseNormalize, "WanLoraPair": WanLoraPair, "LoraOptional": LoraOptional, "KeepOnce": KeepOnce, "SegformerMask": SegformerMask, "SegformerMaskCheck": SegformerMaskCheck, "MaskBBox": MaskBBox, "FrameContactSheet": FrameContactSheet,
                        "AnchorPick": AnchorPick, "DepthPadExtend": DepthPadExtend,
                        "DepthPadDirectional": DepthPadDirectional, "VideoLoadRetime": VideoLoadRetime,
                        "VideoRetimeSettings": VideoRetimeSettings, "VideoClipInfo": VideoClipInfo, "VideoInfo": VideoInfo, "FrameSeqCheck": FrameSeqCheck, "VideoLoadFrames": VideoLoadFrames,
@@ -1102,6 +1250,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {"DepthInverseNormalize": "Depth → 역수 정규�
                               "LoraOptional": "LoRA 한 칸 (None = 안 씀)",
                               "KeepOnce": "한 번만 계산 (실행 안에서 · --cache-none 루프용)",
                               "SegformerMask": "옷·부위 마스크 (segformer · GPU 묶음)",
+                              "SegformerMaskCheck": "마스크 점검 (영상 내내 대상이 잡히나 · 실패면 멈춤)",
                               "MaskBBox": "마스크 둘레 상자 (구간 합집합 · 여백 · 16 배수)",
                               "FrameContactSheet": "프레임 접촉 시트 (번호 표시)",
                               "AnchorPick": "앵커 고르기·고정 (번호 → 보관, lock 이면 후보 생성 생략)",

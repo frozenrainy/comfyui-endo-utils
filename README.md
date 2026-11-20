@@ -17,13 +17,16 @@ into parts that join without a seam, and anchor frames that stay put.
 | **VideoLoadFrames** | Loads a range of frames — a loop over the parts of a long clip |
 | **FrameSeqWrite** | Writes a part's frames to files (no frames piling up in RAM) |
 | **FrameSeqVideo** | Saves the video — from the written frame files (`lock` on) or from its input images |
+| **SegformerMask** | Clothes/body-part masks from a segformer model (e.g. `segformer_b3_clothes`), batched on the GPU. `merge_alike` also takes the classes segformer mixes up with the chosen ones (upper clothes 4 ↔ dress 7, a dress's lower part as skirt 5); `temporal` joins each frame's mask with its neighbours' so a frame or two the labels miss is not left out |
+| **SegformerMaskCheck** | Before anything is drawn: are the chosen classes found all through the video? On frames spread over the clip it reports the mask area, the clothes it does see, a sheet with the mask in red — and stops the run if too many frames have no mask (those frames would come out unchanged) |
+| **MaskBBox** | One box around a batch of masks, to process only around the target and paste it back |
 
 Tooltips and display names are in Korean.
 
 ## Install
 
 Clone into `ComfyUI/custom_nodes/`. Nothing else to install: it uses numpy, torch, Pillow and PyAV, which ComfyUI
-already requires.
+already requires. The segformer nodes also need `transformers` (most environments with segmentation nodes have it).
 
 With ComfyFarm: *System → Rollout → Node packs → Add node pack*, `https://github.com/frozenrainy/comfyui-endo-utils`.
 
